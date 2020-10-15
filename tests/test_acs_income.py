@@ -20,7 +20,7 @@ def fetch(url):
 
 class TestACSIncome(unittest.TestCase):
 
-    def test_median_incomes(self):
+    def x_test_median_incomes(self):
         """Check that the summary stats for the aggregate income of puma,
          roughtly matches between the PUMS and ACS datasets. Both values are
          divided by the median household income of the """

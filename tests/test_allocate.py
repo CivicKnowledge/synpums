@@ -13,22 +13,25 @@ warnings.filterwarnings("ignore")
 state = 'RI'
 year = 2018
 release = 5
-cache_dir = '/Users/eric/proj/data-projects/syntheus/synpums/cache/'
+cache_dir = '/tmp/synpums'
 
 class TestAllocate(unittest.TestCase):
 
     def test_basic(self):
-        tasks = AllocationTask.get_tasks(cache_dir, 'RI', use_tqdm=True, ignore_completed=False)
 
-        self = tasks[150]
-        self.init()
-        self.initialize_weights_set_sample()
+        tasks = AllocationTask.get_tasks(cache_dir, 'RI', ignore_completed=False)
 
-        print(self.total_error)
+        task = tasks[24]
+        task.init()
+        print(task.m90_rms_error)
+        task.initialize_weights_sample()
 
-        self.vector_walk_opt(N=2000, inner_iter_min=1, inner_iter_max=15, init_inc_rate=.1)
+        print(f"te={task.total_error}, rms={task.m90_rms_error}")
+        args = dict(N=2000, min_iter=1000, step_size_max=15, step_size_min=1, reversal_rate=.4, max_ssm=150)
 
-        print(self.total_error)
+        rows = task.vector_walk(**args)
+
+        print(f"te={task.total_error}, rms={task.m90_rms_error}")
 
 
 if __name__ == '__main__':
