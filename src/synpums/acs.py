@@ -44,7 +44,18 @@ def make_puma_tract_map():
 def puma_tract_df():  # To actually use the tract map
     import synpums.data as sd
     from pathlib import Path
-    return pd.read_csv(Path(sd.__file__).parent.joinpath('puma_tract_map.csv'))
+
+    #r =  pd.read_csv(Path(sd.__file__).parent.joinpath('puma_tract_map.csv'))
+
+    # Github ans LFS make this difficult when the packafge is installed from github
+    url = 'http://ds.civicknowledge.org.s3.amazonaws.com/civicknowledge.com/puma_tract_map.csv'
+
+    r = rg.dataframe(url)
+
+    assert len(r) > 100
+
+    return r
+
 
 def puma_tract_map(): # To actually use the tract map
     import synpums.data as sd
