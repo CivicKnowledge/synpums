@@ -8,7 +8,6 @@ from pathlib import Path
 from time import time
 
 import pandas as pd
-
 from synpums.util import *
 
 ''
@@ -77,6 +76,7 @@ class AllocationTask(object):
 
         self.sample_pop = None
         self.sample_weights = None
+        self.unallocated_weights = None  # Initialized to the puma weights, gets decremented
         self.target_marginals = None
         self.allocated_weights = None
         self.household_count = None
@@ -88,6 +88,7 @@ class AllocationTask(object):
         self.hh_size_cols = None
         self.hh_race_type_cols = None
         self.hh_eth_type_cols = None
+        self.hh_income_cols = None
 
         self._init = False
 
@@ -105,7 +106,7 @@ class AllocationTask(object):
         return [tract.state, tract.stusab, tract.county, self.region_geoid, self.puma_geoid, str(self.acs_ref),
                 str(self.hh_ref)]
 
-    def init(self, use_sample_weights=False):
+    def init(self, use_sample_weights=False, puma_weights=None):
         """Load all of the data, just before running the allocation"""
 
         if isinstance(self.hh_ref, pd.DataFrame):
@@ -141,7 +142,7 @@ class AllocationTask(object):
         self.gq_count = acs.loc[self.region_geoid].b26001_001
 
         self.allocated_weights = np.zeros(len(self.sample_pop))
-
+        self.unallocated_weights = puma_weights if puma_weights is not None else self.sample_weights.copy()
         self.running_allocated_marginals = pd.Series(0, index=self.target_marginals.index)
 
         # Sample pop, normalized to unit length to speed up cosine similarity
@@ -162,44 +163,35 @@ class AllocationTask(object):
         p = re.compile(r'b11001[hi]_')
         self.hh_eth_type_cols = [c for c in self.hh_source.columns if p.match(c)]
 
+        p = re.compile(r'b19025')
+        self.hh_income_cols = [c for c in self.hh_source.columns if p.match(c)]
+
         # We will use this identity in the numpy version of step_scjhedule
         # assert all((self.cp.index / 2).astype(int) == self['index'])
 
         self.rng = np.random.default_rng()
 
-        self.init_cp(use_sample_weights=use_sample_weights)
+        self.cp = self.make_cp(self.sample_pop).reset_index(drop=True)
 
         self._init = True
 
         return acs
 
-    def init_cp(self, use_sample_weights=False):
-        self.use_sample_weights = use_sample_weights
-        self.cp = self.make_cp(self.sample_pop)
 
     def make_cp(self, sp):
         """Make a version of the sample population with two records for each
         row, one the negative of the one before it. This is used to generate
         rows that can be used in the vector walk."""
 
-        weights = self.sample_weights if self.use_sample_weights else 1
+        t = pd.concat([sp, sp * -1]).sort_index().reset_index()
+        t.insert(1, 'sign', 0)
+        t.insert(2, 'select_weight', 0)
+        t.loc[0::2, 'sign'] = 1
+        t.loc[0::2, 'select_weight'] = self.unallocated_weights.tolist()
+        t.loc[1::2, 'sign'] = -1
+        t.loc[1::2, 'select_weight'] = self.allocated_weights.tolist()
 
-        sp_pos = sp.copy()
-        sp_pos['sign'] = 1
-        sp_pos.insert(0, 'select_weight', weights)
-
-        sp_neg = sp.copy() * -1
-        sp_neg['sign'] = -1
-        sp_neg.insert(0, 'select_weight', weights)
-
-        # Combined sample population, for calculating trial errors
-        cp = pd.concat([sp_pos, sp_neg])
-        cp.index.name = 'index'
-        cp = cp.set_index('sign', append=True)
-
-        # Probability of row being selected in the step_schedule function
-
-        return cp.sort_index()
+        return t
 
     def set_cp_prob(self, cp_prob):
         pass
@@ -400,6 +392,7 @@ class AllocationTask(object):
 
         t = self.sample_pop.sample(target_count, weights=initial_weights, replace=True)
         self.allocated_weights = self._pop_to_weights(t)
+        self.unallocated_weights -= self.allocated_weights
 
         self.running_allocated_marginals = self.allocated_marginals
 
@@ -459,6 +452,8 @@ class AllocationTask(object):
 
         self.allocated_weights = (self.sample_weights / (self.sample_weights.sum())).multiply(
             self.household_count).values.round(0).astype(float)
+
+        self.unallocated_weights -= self.allocated_weights
 
     def step_schedule_np(self, i, N, cp, te, td, step_size_max, step_size_min, reversal_rate, p=None):
         """ Return the next set of samples to add or remove
@@ -530,6 +525,45 @@ class AllocationTask(object):
         # Columns are : 'index', 'sign', 'delta_err'
         return np.hstack([cp[idx][:, 0:2], total_errors[idx].reshape(-1, 1)])  # Return the index and sign columns of cp
 
+    def _loop_asignment(self, ss):
+
+        for j, (idx, sgn, *_) in enumerate(ss):
+            idx = int(idx)
+            if (self.allocated_weights[idx] > 0 and sgn < 0) or \
+                    (self.unallocated_weights[idx]>0 and sgn > 0) :
+                self.running_allocated_marginals += (sgn * self.sample_pop.iloc[idx])
+                self.allocated_weights[idx] += sgn  # Increment the count column
+                self.unallocated_weights[idx] -= sgn
+
+
+    def _numpy_assignment(self, ss):
+        # The following code is the numpy equivalent of the loop version of
+        # assignment to the allocated marginals. It is about 20% faster than the loop
+
+        # This selection on ss is the equivalent to this if statement in the loop version:
+        #   if self.allocated_weights[idx] > 0 or sgn > 0:
+        #
+        ss = ss[np.logical_or(
+            np.isin(ss[:, 0], np.nonzero(self.allocated_weights > 0)),  # self.allocated_weights[idx] > 0
+            ss[:, 1] > 0)  # sgn > 0
+        ]
+
+        # Assign the steps from the step schedule into the allocated weights
+        if len(ss):
+            idx = ss[:, 0].astype(int)
+            sgn = ss[:, 1]
+
+            # Update all weights by the array of signs
+            self.allocated_weights[idx] += sgn
+
+            # Don't allow negative weights
+            self.allocated_weights[self.allocated_weights < 0] = 0
+
+            # Add in the signed sampled to the running marginal, to save the cost
+            # of re-calculating the marginals.
+            self.running_allocated_marginals += \
+                np.multiply(self.sample_pop.iloc[idx], sgn.reshape(ss.shape[0], -1)).sum()
+
     def _vector_walk(self, N=2000, min_iter=750, target_error=0.03, step_size_min=3, step_size_max=15,
                      reversal_rate=.3, max_ssm=250, cb=None, memo=None):
         """Allocate PUMS records to this object's region.
@@ -544,7 +578,6 @@ class AllocationTask(object):
             max_ssm:
 
         """
-
         assert self._init
 
         if target_error < 1:
@@ -553,15 +586,6 @@ class AllocationTask(object):
         min_allocation = None  # allocated weights at last minimum
         steps_since_min = 0
 
-        # CP with no rows with no nonzero weight in the allocations
-        # Removing zero weight samples only works when the allocated weights
-        # is initialized before starting the vector walk.
-        aw = pd.Series(self.allocated_weights, name='weight')
-        sp = self.sample_pop.iloc[aw[aw > 0].index] if aw.sum() > 0 else self.sample_pop
-        self.cp_df = self.make_cp(sp).reset_index()
-        cp = self.cp_df.values.astype(int)
-
-        self.cp_prob = self.cp_df.select_weight.values
 
         min_error = self.total_error
 
@@ -575,10 +599,18 @@ class AllocationTask(object):
             td = self.running_target_diff
             te = vector_length(td)
 
+            # The unallocated weights can be updated both internally and externally --
+            # the array can be shared among all tracts in the puma
+            self.cp.loc[0::2, 'select_weight'] = 1#self.unallocated_weights
+            self.cp.loc[1::2, 'select_weight'] = 1# self.allocated_weights
+            cp = self.cp.values.astype(int)
+            self.cp_prob = self.cp.select_weight.values
+
             if te < min_error:
                 min_error = te
                 min_allocation = self.allocated_weights
                 steps_since_min = 0
+
             else:
                 steps_since_min += 1
 
@@ -588,46 +620,20 @@ class AllocationTask(object):
                 break
 
             try:
+
                 ss = self.step_schedule_np(i, N, cp, te, td.values.astype(int),
-                                           step_size_min, step_size_max, reversal_rate,
-                                           p=self.cp_prob)
-            except ValueError:
+                                           step_size_max, step_size_min, reversal_rate)
+
+                self._loop_asignment(ss)
+
+                yield (i, te, min_error, steps_since_min, len(ss))
+
+            except ValueError as e:
                 # Usually b/c numpy choice() got an empty array
-                continue
+                pass
+                print(e)
 
-            # This is the equivalent of the if statement in the loop version in _loop_assignment
-            #   if self.allocated_weights[idx] > 0 or sgn > 0:
-            # The loop equivalent is:
-            #
-            # for j, row in enumerate(ss):
-            #     idx = int(row[0])
-            #     sgn = row[1]
-            #     if self.allocated_weights[idx] > 0 or sgn > 0:
-            #         self.allocated_weights[idx] += sgn  # Increment the count column
-            #         self.running_allocated_marginals += sgn * self.sample_pop.iloc[idx]
 
-            ss = ss[np.logical_or(
-                np.isin(ss[:, 0], np.nonzero(self.allocated_weights > 0)),  # self.allocated_weights[idx] > 0
-                ss[:, 1] > 0)  # sgn > 0
-            ]
-
-            # Assign the steps from the step schedule into the allocated weights
-            if len(ss):
-                idx = ss[:, 0].astype(int)
-                sgn = ss[:, 1]
-
-                # Update all weights by the array of signs
-                self.allocated_weights[idx] += sgn
-
-                # Don't allow negative weights
-                self.allocated_weights[self.allocated_weights < 0] = 0
-
-                # Add in the signed sampled to the running marginal, to save the cost
-                # of re-calculating the marginals.
-                self.running_allocated_marginals += \
-                    np.multiply(self.sample_pop.iloc[idx], sgn.reshape(ss.shape[0], -1)).sum()
-
-            yield (i, te, min_error, steps_since_min, len(ss))
 
         if min_allocation is not None:
             self.allocated_weights = min_allocation
@@ -812,23 +818,74 @@ class PumaAllocator(object):
     """Simultaneously allocate all of the tracts in a pums, attempting to reduce the
     error between the sum of the allocated weights and the PUMS weights"""
 
-    def __init__(self, puma_geoid, tasks, cache_dir):
+    def __init__(self, puma_geoid, tasks, cache_dir, state, year=2018, release=5):
 
         self.cache_dir = cache_dir
         self.puma_geoid = puma_geoid
         self.tasks = tasks
 
+        self.year = year
+        self.release = release
+        self.state = state
+
         pums_files = [task.hh_ref for task in self.tasks]
         assert all([e == pums_files[0] for e in pums_files])
+
+        self.pums_file = pums_files[0]
+
+        self._puma_target_marginals = None
+        self._puma_allocated_marginals = None
+
+        self._puma_max_weights = None
+        self._puma_allocated_weights = None
+        self._puma_unallocated_weights = None
 
         self.pums = pd.read_csv(pums_files[0], low_memory=False)
 
         self.weights = pd.DataFrame({
             'allocated': 0,
-            'pums': self.pums.WGTP
+            'pums': self.pums.WGTP,  # Original PUMS weights
+            'remaining': self.pums.WGTP  # Remaining
         })
 
         self.prob = None
+
+        self.gq_cols = None
+        self.sex_age_cols = None
+        self.hh_size_cols = None
+        self.hh_race_type_cols = None
+        self.hh_eth_type_cols = None
+        self.hh_income_cols = None
+
+    def init(self, init_method='sample'):
+        """Initialize the weights of all of the tasks"""
+        from tqdm import tqdm
+
+        self.hh_ref = hh_source = pd.read_csv(self.tasks[0].hh_ref, index_col='SERIALNO', low_memory=False) \
+            .drop(columns=['geoid'], errors='ignore').astype('Int64')
+
+        self._puma_max_weights = hh_source.iloc[:, 0].reset_index(drop=True).astype(int)
+
+        self._puma_unallocated_weights = self._puma_max_weights.copy()
+
+        for task in tqdm(self.tasks):
+            task.init(puma_weights=self._puma_unallocated_weights)
+
+            if init_method == 'sample':
+                self.initialize_weights_sample(task)
+            if init_method == 'set':
+                task.initialize_weights_set_sample()
+
+        t0 = self.tasks[0]  # Just to copy out some internal info.
+
+        self.gq_cols = t0.gq_cols
+        self.sex_age_cols = t0.sex_age_cols
+        self.hh_size_cols = t0.hh_size_cols
+        self.hh_race_type_cols = t0.hh_race_type_cols
+        self.hh_eth_type_cols = t0.hh_eth_type_cols
+
+        p = re.compile(r'b19025')
+        self.hh_income_cols = [c for c in t0.hh_source.columns if p.match(c)]
 
     @classmethod
     def get_tasks(cls, cache_dir, state, year=2018, release=5):
@@ -852,33 +909,184 @@ class PumaAllocator(object):
         for task in tasks:
             puma_tasks[task.puma_geoid].append(task)
 
-        return [PumaAllocator(puma_geoid, tasks, cache_dir) for puma_geoid, tasks in puma_tasks.items()]
+        return [PumaAllocator(puma_geoid, tasks, cache_dir, state, year, release) for puma_geoid, tasks in
+                puma_tasks.items()]
 
-    def _update_weights(self):
+    def initialize_weights_sample(self, task, frac=.7):
 
-        self.weights['allocated'] = np.sum(np.array([task.allocated_weights for task in self.tasks]), axis=0)
+        """Initialize the allocated weights proportional to the sample population weights,
+        adjusted to the total population. """
 
+        wf = self.weights_frame
+
+        wn1 = wf.remaining / wf.remaining.sum()  # weights normalized to 1
+
+        task.allocated_weights = rand_round(wn1.multiply(task.household_count).values.astype(float))
+
+        task.unallocated_weights -= task.allocated_weights
+
+    def vector_walk(self, N=2000, min_iter=750, target_error=0.03, step_size_min=1, step_size_max=10,
+                    reversal_rate=.3, max_ssm=250, callback=None, memo=None):
+        """Run a vector walk on all of the tracts tasks in this puma """
+
+        from itertools import cycle
+
+        rows = []
+
+        ts = time()
+
+        def make_vw(task):
+            return iter(task._vector_walk(
+                N=N, min_iter=min_iter, target_error=target_error,
+                step_size_min=step_size_min, step_size_max=step_size_max,
+                reversal_rate=reversal_rate, max_ssm=max_ssm))
+
+        task_iters = [(task, make_vw(task)) for task in self.tasks]
+
+        stopped = set()
+        running = set([e[0] for e in task_iters])
+
+        memo['n_stopped'] = len(stopped)
+        memo['n_running'] = len(running)
+        memo['n_calls'] = 0
+
+        for task, task_iter in cycle(task_iters):
+
+            if task in running:
+                try:
+
+                    i, te, min_error, steps_since_min, n_iter = next(task_iter)
+                    memo['n_calls'] += 1
+
+                    d = {'i': i, 'time': time() - ts, 'step_size': n_iter, 'error': te,
+                         'target_error': target_error,
+                         'size': np.sum(task.allocated_weights),
+                         'ssm': steps_since_min,
+                         'min_error': min_error,
+                         'task': task
+                         }
+
+                    rows.append(d)
+
+                    if callback and i % 10 == 0:
+                        callback(self, task, d, memo)
+
+                except StopIteration:
+
+                    stopped.add(task)
+                    running.remove(task)
+
+                    if len(running) == 0:
+                        return rows
+
+                    memo['n_stopped'] = len(stopped)
+                    memo['n_running'] = len(running)
+
+            callback(self, None, None, memo)
+
+        return rows
+
+    def get_task(self, geoid):
+        for task in self.tasks:
+            if geoid == task.region_geoid:
+                return task
+
+        return None
+
+    def tune_puma_allocation(self):
+        """Re-run all of the tasks in the puma, trying to reduce the discrepancy
+        between the """
+        task_iters = [(task, iter(task._vector_walk())) for task in self.tasks]
+
+        for task, task_iter in task_iters:
+            try:
+                task.cp_prob = self._update_probabilities()
+                row = next(task_iter)
+                print(task.region_geoid, self.rms_error, self.rms_weight_error, np.sum(task.cp_prob))
+
+            except StopIteration:
+                print(task.region_geoid, 'stopped')
+
+    @property
+    def weights_frame(self):
+        self.weights[
+            'allocated'] = self.puma_allocated_weights  # np.sum(np.array([task.allocated_weights for task in self.tasks]), axis=0)
+        self.weights['remaining'] = self.weights.pums - self.weights.allocated
         self.weights['dff'] = self.weights.allocated - self.weights.pums
         self.weights['rdff'] = (self.weights.dff / self.weights.pums).fillna(0)
         self.weights['p'] = self.weights.rdff
+
+        return self.weights
 
     def _update_probabilities(self):
         """Update the running cp_probs, the probabilities for selecting each PUMS
         household from the sample_pop, based on the error in weights for
         the households at the Puma level"""
 
-        self.weights['p_pos'] = -self.weights.p.where(self.weights.p < 0, 0)
-        self.weights['p_neg'] = self.weights.p.where(self.weights.p > 0, 0)
-        self.prob = np.array(self.weights[['p_neg', 'p_pos']].values.flat)
+        w = self.weights_frame
+
+        w['p_pos'] = - w.p.where(w.p < 0, 0)
+        w['p_neg'] = w.p.where(w.p > 0, 0)
+        self.prob = np.array(w[['p_neg', 'p_pos']].values.flat)
         return self.prob
 
-    def initialize_weights(self):
-        """Initialize the weights of all of the tasks"""
-        from tqdm import tqdm
-        for task in tqdm(self.tasks):
-            task.initialize_weights_set_sample()
+    @property
+    def puma_target_marginals(self):
+        from .acs import build_acs
 
-        self._update_weights()
+        if self._puma_target_marginals is None:
+            _puma_marginals = build_acs(state=self.state, sl='puma', year=self.year, release=self.release)
+
+            cols = self.tasks[
+                0].target_marginals.index  # [c for c in _puma_marginals.columns if c.startswith('b') and not c.endswith('_m90')]
+            self._puma_target_marginals = _puma_marginals.loc[self.puma_geoid][cols]
+
+        return self._puma_target_marginals
+
+    @property
+    def puma_allocated_marginals(self):
+
+        return self.allocated_marginals.sum()
+
+    @property
+    def allocated_marginals(self):
+
+        series = {task.region_geoid: task.allocated_marginals for task in self.tasks}
+
+        return pd.DataFrame(series).T
+
+    @property
+    def allocated_weights(self):
+
+        series = {task.region_geoid: task.allocated_weights for task in self.tasks}
+
+        return pd.DataFrame(series).T
+
+    @property
+    def puma_allocated_weights(self):
+
+        return self.allocated_weights.sum()
+
+    @property
+    def target_marginals(self):
+
+        series = {task.region_geoid: task.target_marginals.est for task in self.tasks}
+
+        return pd.DataFrame(series).T
+
+    @property
+    def target_errors(self):
+
+        series = {task.region_geoid: task.total_error for task in self.tasks}
+
+        return pd.Series(series)
+
+    @property
+    def target_diff(self):
+
+        series = {task.region_geoid: task.target_diff for task in self.tasks}
+
+        return pd.DataFrame(series).T
 
     @property
     def rms_error(self):
@@ -888,67 +1096,4 @@ class PumaAllocator(object):
 
     @property
     def rms_weight_error(self):
-        return np.sqrt(np.mean(np.square(self.weights.dff)))
-
-    def vector_walk(self, N=2000, min_iter=750, target_error=0.03, step_size_min=1, step_size_max=10,
-                    reversal_rate=.3, max_ssm=250, callback=None, memo=None):
-        """Consider the target state and each household to be a vector. For each iteration
-        select a household vector with the best cosine similarity to the vector to the
-        target and add that household to the population. """
-
-        rows = []
-
-        from tqdm import tqdm
-
-        ts = time()
-
-        for task in tqdm(self.tasks):
-
-            self.init()
-
-            errors = deque(maxlen=20)
-            errors.extend([task.total_error] * 20)
-
-            for i, te, min_error, steps_since_min, n_iter in task._vector_walk(
-                    N=N, min_iter=min_iter, target_error=target_error,
-                    step_size_min=step_size_min, step_size_max=step_size_max,
-                    reversal_rate=reversal_rate, max_ssm=max_ssm):
-
-                d = {'i': i, 'time': time() - ts, 'step_size': n_iter, 'error': te,
-                     'target_error': target_error,
-                     'size': np.sum(task.allocated_weights),
-                     'ssm': steps_since_min,
-                     'min_error': min_error,
-                     'mean_error': np.mean(errors), 'std_error': np.std(errors),
-                     'mean_dev_error': np.mean(np.diff(errors)),
-                     'mean_std_dev_error': np.std(np.diff(errors)),
-                     'mean_2dev_error': np.mean(np.diff(np.diff(errors))),
-                     'mean_std_2dev_error': np.std(np.diff(np.diff(errors))),
-                     }
-
-                rows.append(d)
-                errors.append(te)
-
-                if callback and i % 10 == 0:
-                    callback(self, d, memo)
-
-        self._update_weights()
-
-        return rows
-
-    def tune_puma_allocation(self):
-        """Re-run all of the tasks in the puma, trying to reduce the discrepancy
-        between the """
-        task_iters = [(task, iter(task._vector_walk())) for task in self.tasks]
-
-        for task, task_iter in task_iters:
-            try:
-
-                self._update_weights()
-                prob = self._update_probabilities()
-                task.cp_prob = prob
-                row = next(task_iter)
-                print(task.region_geoid, self.rms_error, self.rms_weight_error)
-
-            except StopIteration:
-                print(task.region_geoid, 'stopped')
+        return np.sqrt(np.mean(np.square(self.weights_frame.dff)))

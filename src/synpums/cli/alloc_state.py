@@ -222,7 +222,7 @@ def main(args):
 
     if args.parallel:
 
-        n_cpu = int(cpu_count() * .75)
+        n_cpu = cpu_count()-2
 
         multi_tasks = [(state, cache_dir, args.test, 'mp') for state in states]
 

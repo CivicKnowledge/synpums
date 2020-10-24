@@ -20,3 +20,21 @@ def vector_length(v):
 def vector_normalize(v):
     """Normalize a single vector"""
     return v/vector_length(v)
+
+
+def _rand_round(v):
+    """Randomly round a value up or down to the nearest integer, with probabilities based on the
+    value. Generally, np.mean([rand_round(v) for _ in range(N)]) == v, for large enough N
+    """
+    if v == 0:
+        return v
+
+    f, c = np.floor(v), np.ceil(v)
+
+    try:
+        return np.random.choice([f, c], p=[c - v, v - f])
+    except:
+        print(v, f, c)
+        raise
+
+rand_round = np.vectorize(_rand_round)
