@@ -25,7 +25,7 @@ from time import time
 from geoid.censusnames import stusab
 from tqdm import tqdm
 
-from synpums import AllocationTask, __version__
+from synpums import AllocationTask, PumaAllocator, __version__
 from synpums.allocate import _logger as alloc_logger
 
 __author__ = "Eric Busboom"
@@ -53,6 +53,8 @@ def parse_args(args):
     parser.add_argument("-d", "--dir", default=getcwd(), help="Output directory")
 
     parser.add_argument("-t", "--test", type=int, help="Run a number of tasks, for testing")
+
+    parser.add_argument("-p", "--puma", action='store_true', help="Run pumas, rather than individual tracts")
 
     parser.add_argument("-T", "--tasks", action='store_true', help="Only generate tasks")
 
@@ -131,9 +133,9 @@ def logging_task_callback(task, d, memo):
         dt = memo['last_task_time'] - memo['start_time']
         memo['task_rate'] = round(dt / memo['task_i'], 2)
 
-def run_task(task, cb, memo, state='??', log=None, pbar=None):
+def run_tract_task(task, cb, memo, state='??', log=None, pbar=None):
     t_start = time()
-    task.run_2stage(callback=cb, memo=memo)
+    task.run(callback=cb, memo=memo)
     dt = time() - t_start
 
     if memo is not None:
@@ -146,7 +148,7 @@ def run_task(task, cb, memo, state='??', log=None, pbar=None):
         log(f'Allocated {task.region_geoid} state {state} error={task.total_error:07.2f}'
             f' rms_error={task.m90_rms_error:07.2f} dt={dt:3.1f}')
 
-def run_state(state, cache_dir, task_limit, progress='tqdm'):
+def run_state_by_tract(state, cache_dir, task_limit, progress='tqdm'):
     """Run a single state"""
     if progress == 'mp':
         log = print
@@ -182,10 +184,69 @@ def run_state(state, cache_dir, task_limit, progress='tqdm'):
         pbar = None
 
     for task in non_exists_tasks:
-        run_task(task, cb, memo, state=state, log=log, pbar=pbar)
+        run_tract_task(task, cb, memo, state=state, log=log, pbar=pbar)
 
     if pbar:
         pbar.close()
+
+def run_puma_task(task, cb, memo, state='??', log=None, pbar=None):
+    t_start = time()
+
+    task.run(callback=cb, memo=memo)
+    dt = time() - t_start
+
+    if memo is not None:
+        memo['last_task_time'] = time()
+        memo['task_i'] += 1
+
+    if pbar:
+        pbar.update()
+    elif log:
+        log(f'Allocated {task.region_geoid} state {state} error={task.total_error:07.2f}'
+            f' rms_error={task.m90_rms_error:07.2f} dt={dt:3.1f}')
+
+def run_state_by_puma(state, cache_dir, task_limit, progress='tqdm'):
+    """Run a single state, one PUMA at a time, rather than independent tracxts. """
+    if progress == 'mp':
+        log = print
+    else:
+        log = _logger.info
+
+    log(f'Loading tasks for state {state}')
+
+    ptasks = PumaAllocator.get_allocators(cache_dir, 'RI')
+
+    log(f'Loaded {len(ptasks)} puma tasks for state {state}')
+    skipped = 0
+    non_exists_tasks = []
+
+    for task in ptasks:
+        if task.path.exists():
+            skipped += 1
+        else:
+            non_exists_tasks.append(task)
+
+    memo = {'start_time': time(), 'last_iter_time': None, 'task_n': len(ptasks),
+            'last_task_time': None, 'iters': 0, 'task_i': 0, 'task_skip': skipped, 'task_rate': 0,
+            'state': state}
+
+    if progress == 'tqdm':
+        pbar = tqdm(total=len(non_exists_tasks))
+        cb = tqdm_task_callback
+        memo['pbar'] = pbar
+    elif progress == 'debug':
+        cb = logging_task_callback
+        pbar = None
+    else:
+        cb = None
+        pbar = None
+
+    for task in non_exists_tasks:
+        run_puma_task(task, cb, memo, state=state, log=log, pbar=pbar)
+
+    if pbar:
+        pbar.close()
+
 
 def main(args):
     """Main entry point allowing external calls
@@ -220,6 +281,14 @@ def main(args):
     else:
         progress = None  # No progress logging, just regular info logging
 
+    if args.puma:
+        state_func = run_state_by_puma
+        region_func = run_puma_task
+    else:
+        state_func = run_state_by_tract
+        region_func = run_tract_task
+
+
     if args.parallel:
 
         n_cpu = cpu_count()-2
@@ -229,7 +298,7 @@ def main(args):
         if len(states) > 1:
             with Pool(n_cpu) as p:
                 _logger.info(f'Running {len(states)} states with {n_cpu} processes')
-                p.starmap(run_state, multi_tasks)
+                p.starmap(state_func, multi_tasks)
         else:
             state = states[0]
             non_exists_tasks = [task for task in AllocationTask.get_tasks(cache_dir, state) if not task.path.exists()]
@@ -240,12 +309,11 @@ def main(args):
             _logger.info(f'Running 1 states with {len(non_exists_tasks)} tasks on {n_cpu} processes')
 
             with Pool(n_cpu) as p:
-                p.starmap(run_task, multi_tasks)
-
+                p.starmap(region_func, multi_tasks)
 
     else:
         for state in states:
-            run_state(state, cache_dir, task_limit=args.test, progress=progress)
+            state_func(state, cache_dir, task_limit=args.test, progress=progress)
 
 
 def run():
