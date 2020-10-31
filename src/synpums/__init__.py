@@ -14,3 +14,4 @@ from synpums.allocate import *  # noqa: F401 F403
 from synpums.pums import *  # noqa: F401 F403
 from synpums.acs import *  # noqa: F401 F403
 from synpums.age_sex import age_sex_map # noqa: F401 F403
+from synpums.marginals import *

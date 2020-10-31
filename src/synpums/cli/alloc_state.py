@@ -23,10 +23,9 @@ from pathlib import Path
 from time import time
 
 from geoid.censusnames import stusab
-from tqdm import tqdm
-
 from synpums import AllocationTask, PumaAllocator, __version__
 from synpums.allocate import _logger as alloc_logger
+from tqdm import tqdm
 
 __author__ = "Eric Busboom"
 __copyright__ = "Eric Busboom"
@@ -105,8 +104,7 @@ def setup_logging(args):
     alloc_logger.setLevel(loglevel)
 
 
-def tqdm_task_callback(task, d, memo):
-
+def tqdm_task_callback(puma_task, task, d, memo):
     memo['pbar'].set_description(
         f"{task.region_geoid} {memo['state']} i={d['i']:3d}  err={d['error']:07.2f}/{d['target_error']:07.2f}"
         f" size={int(d['size']):5d} Task {memo['task_i']} of  {memo['task_n']}.  {memo['task_skip']} skipped. {memo['task_rate']} sec/task "
@@ -119,12 +117,19 @@ def tqdm_task_callback(task, d, memo):
         memo['task_rate'] = round(dt / memo['task_i'], 2)
 
 
-def logging_task_callback(task, d, memo):
+def logging_task_callback(puma_task, task, d, memo):
+    if memo is None or d is None:
+        return
 
+    if 'n_running' in memo:
+        puma_info = f" {memo['n_running']} ptasks running, {memo['n_stopped']} stopped "
+    else:
+        puma_inf0 = ''
 
     _logger.info(
         f"{task.region_geoid} {memo['state']} i={d['i']:3d}  err={d['error']:07.2f}/{d['target_error']:07.2f}"
-        f" size={int(d['size']):5d} Task {memo['task_i']} of  {memo['task_n']}.  {memo['task_skip']} skipped. {memo['task_rate']} sec/task "
+        f" size={int(d['size']):5d} Task {memo['task_i']} of  {memo['task_n']}.  {memo['task_skip']} skipped. "
+        f"{memo['task_rate']} sec/task {puma_info}"
     )
 
     memo['last_iter_time'] = time()
@@ -132,6 +137,7 @@ def logging_task_callback(task, d, memo):
     if memo['last_task_time']:
         dt = memo['last_task_time'] - memo['start_time']
         memo['task_rate'] = round(dt / memo['task_i'], 2)
+
 
 def run_tract_task(task, cb, memo, state='??', log=None, pbar=None):
     t_start = time()
@@ -147,6 +153,7 @@ def run_tract_task(task, cb, memo, state='??', log=None, pbar=None):
     elif log:
         log(f'Allocated {task.region_geoid} state {state} error={task.total_error:07.2f}'
             f' rms_error={task.m90_rms_error:07.2f} dt={dt:3.1f}')
+
 
 def run_state_by_tract(state, cache_dir, task_limit, progress='tqdm'):
     """Run a single state"""
@@ -189,6 +196,7 @@ def run_state_by_tract(state, cache_dir, task_limit, progress='tqdm'):
     if pbar:
         pbar.close()
 
+
 def run_puma_task(task, cb, memo, state='??', log=None, pbar=None):
     t_start = time()
 
@@ -202,8 +210,9 @@ def run_puma_task(task, cb, memo, state='??', log=None, pbar=None):
     if pbar:
         pbar.update()
     elif log:
-        log(f'Allocated {task.region_geoid} state {state} error={task.total_error:07.2f}'
-            f' rms_error={task.m90_rms_error:07.2f} dt={dt:3.1f}')
+        log(f'Allocated puma {task.puma_geoid} state {state} tract_error={task.rms_error:07.2f}'
+            f' weight_error={task.rms_weight_error:07.2f} dt={dt:3.1f}')
+
 
 def run_state_by_puma(state, cache_dir, task_limit, progress='tqdm'):
     """Run a single state, one PUMA at a time, rather than independent tracxts. """
@@ -214,7 +223,7 @@ def run_state_by_puma(state, cache_dir, task_limit, progress='tqdm'):
 
     log(f'Loading tasks for state {state}')
 
-    ptasks = PumaAllocator.get_allocators(cache_dir, 'RI')
+    ptasks = PumaAllocator.get_allocators(cache_dir, state)
 
     log(f'Loaded {len(ptasks)} puma tasks for state {state}')
     skipped = 0
@@ -288,10 +297,9 @@ def main(args):
         state_func = run_state_by_tract
         region_func = run_tract_task
 
-
     if args.parallel:
 
-        n_cpu = cpu_count()-2
+        n_cpu = cpu_count() - 2
 
         multi_tasks = [(state, cache_dir, args.test, 'mp') for state in states]
 

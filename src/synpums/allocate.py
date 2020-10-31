@@ -30,8 +30,11 @@ def rms(s):
     """Root mean square"""
     return np.sqrt(np.sum(np.square(s)))
 
+def vector_walk_callback(puma_task, tract_task, data, memo):
+    pass
 
 def make_acs_target_df(acs, columns, geoid):
+
     t = acs.loc[geoid]
 
     target_map = {c + '_m90': c for c in columns if "WGTP" not in columns}
@@ -120,6 +123,14 @@ class AllocationTask(object):
         else:
             acs = pd.read_csv(self.acs_ref, index_col='geoid', low_memory=False)
 
+        # These are only for debugging.
+        #self.hh_source = hh_source
+        #self.tract_acs = acs
+
+        return self._do_init(hh_source, acs, puma_weights=puma_weights)
+
+    def _do_init(self, hh_source, acs, puma_weights=None):
+
         self.serialno = hh_source.index
 
         # Col 0 is the WGTP column
@@ -128,6 +139,8 @@ class AllocationTask(object):
 
         # Not actually a sample pop --- populations are supposed to be unweighted
         self.sample_pop = hh_source[['WGTP'] + not_w_cols].iloc[:, 1:].reset_index(drop=True).astype(int)
+        # Shouldn't this be:
+        # self.sample_pop = hh_source[not_w_cols].reset_index(drop=True).astype(int)
 
         self.sample_weights = hh_source.iloc[:, 0].reset_index(drop=True).astype(int)
 
@@ -140,6 +153,7 @@ class AllocationTask(object):
         self.household_count = acs.loc[self.region_geoid].b11016_001
         self.population_count = acs.loc[self.region_geoid].b01003_001
         self.gq_count = acs.loc[self.region_geoid].b26001_001
+
         self.total_count = self.household_count + self.gq_count
 
         self.allocated_weights = np.zeros(len(self.sample_pop))
@@ -149,23 +163,19 @@ class AllocationTask(object):
         # Sample pop, normalized to unit length to speed up cosine similarity
         self.sample_pop_norm = vectors_normalize(self.sample_pop.values)
 
-        # These are only for debugging.
-        self.hh_source = hh_source
-        self.tract_acs = acs
-
         # Column sets
         self.gq_cols = ['b26001_001']
-        self.sex_age_cols = [c for c in self.hh_source.columns if c.startswith('b01001')]
-        self.hh_size_cols = [c for c in self.hh_source.columns if c.startswith('b11016')]
+        self.sex_age_cols = [c for c in hh_source.columns if c.startswith('b01001')]
+        self.hh_size_cols = [c for c in hh_source.columns if c.startswith('b11016')]
 
         p = re.compile(r'b11001[^hi]_')
-        self.hh_race_type_cols = [c for c in self.hh_source.columns if p.match(c)]
+        self.hh_race_type_cols = [c for c in hh_source.columns if p.match(c)]
 
         p = re.compile(r'b11001[hi]_')
-        self.hh_eth_type_cols = [c for c in self.hh_source.columns if p.match(c)]
+        self.hh_eth_type_cols = [c for c in hh_source.columns if p.match(c)]
 
         p = re.compile(r'b19025')
-        self.hh_income_cols = [c for c in self.hh_source.columns if p.match(c)]
+        self.hh_income_cols = [c for c in hh_source.columns if p.match(c)]
 
         # We will use this identity in the numpy version of step_scjhedule
         # assert all((self.cp.index / 2).astype(int) == self['index'])
@@ -585,8 +595,9 @@ class AllocationTask(object):
             self.running_allocated_marginals += \
                 np.multiply(self.sample_pop.iloc[idx], sgn.reshape(ss.shape[0], -1)).sum()
 
-    def _vector_walk(self, N=2000, min_iter=750, target_error=0.03, step_size_min=3, step_size_max=15,
-                     reversal_rate=.3, max_ssm=250, cb=None, memo=None):
+    def _vector_walk(self, N=2000, min_iter=750, target_error=0.03,
+                     step_size_min=3, step_size_max=15, reversal_rate=.3,
+                     max_ssm=250, cb=None, memo=None):
         """Allocate PUMS records to this object's region.
 
         Args:
@@ -612,7 +623,8 @@ class AllocationTask(object):
         self.running_allocated_marginals = self.allocated_marginals
 
         if cb:
-            cb(self, memo)
+            # vector_walk_callback(puma_task, tract_task, data, memo):
+            cb(memo.get('puma_task'), self, None, memo)
 
         for i in range(N):
 
@@ -654,7 +666,7 @@ class AllocationTask(object):
             self.allocated_weights = min_allocation
 
     def vector_walk(self, N=2000, min_iter=750, target_error=0.03, step_size_min=3, step_size_max=10,
-                    reversal_rate=.3, max_ssm=250, callback=None, init_cb=None, memo=None,
+                    reversal_rate=.3, max_ssm=250, callback=None, memo=None,
                     stats = True):
         """Consider the target state and each household to be a vector. For each iteration
         select a household vector with the best cosine similarity to the vector to the
@@ -671,7 +683,7 @@ class AllocationTask(object):
                 N=N, min_iter=min_iter, target_error=target_error,
                 step_size_min=step_size_min, step_size_max=step_size_max,
                 reversal_rate=reversal_rate, max_ssm=max_ssm,
-                cb=init_cb, memo=memo)
+                cb=callback, memo=memo)
 
         if stats is not True:
             list(g)
@@ -696,7 +708,9 @@ class AllocationTask(object):
                 errors.append(te)
 
                 if callback and i % 10 == 0:
-                    callback(self, d, memo)
+                    # vector_walk_callback(puma_task, tract_task, data, memo):
+                    callback(None, self, None, memo)
+
 
             return rows
 
@@ -806,14 +820,13 @@ class AllocationTask(object):
 
         return tasks
 
-    def run(self, *args, callback=None, init_callback=None, memo=None, **kwargs):
+    def run(self, *args, callback=None, memo=None, **kwargs):
 
         self.init()
 
         self.initialize_weights_sample()
 
-        rows = self.vector_walk(*args, callback=callback, init_cb=init_callback,
-                                memo=memo, **kwargs)
+        rows = self.vector_walk(*args, callback=callback, memo=memo, **kwargs)
 
         self.save_frame()
 
@@ -828,6 +841,7 @@ class PumaAllocator(object):
 
         self.cache_dir = cache_dir
         self.puma_geoid = puma_geoid
+
         self.tasks = tasks
 
         self.year = year
@@ -927,14 +941,20 @@ class PumaAllocator(object):
 
         wf = self.weights_frame
 
+        assert wf.remaining.sum() != 0
+
         wn1 = wf.remaining / wf.remaining.sum()  # weights normalized to 1
 
         task.allocated_weights = rand_round(wn1.multiply(task.household_count).values.astype(float))
 
-        task.unallocated_weights -= task.allocated_weights
+        task.unallocated_weights = np.clip(task.unallocated_weights-task.allocated_weights, a_min=0, a_max=None)
+
+        assert not any(task.unallocated_weights<0)
+
 
     def vector_walk(self, N=1200, min_iter=5000, target_error=0.03, step_size_min=1,
-                    step_size_max=10, reversal_rate=.3, max_ssm=150, callback=None, memo=None):
+                    step_size_max=10, reversal_rate=.3, max_ssm=150,
+                    callback=None, memo=None):
         """Run a vector walk on all of the tracts tasks in this puma """
 
         from itertools import cycle
@@ -943,11 +963,14 @@ class PumaAllocator(object):
 
         ts = time()
 
+        memo['puma_task'] = self
+
         def make_vw(task):
             return iter(task._vector_walk(
                 N=N, min_iter=min_iter, target_error=target_error,
                 step_size_min=step_size_min, step_size_max=step_size_max,
-                reversal_rate=reversal_rate, max_ssm=max_ssm))
+                reversal_rate=reversal_rate, max_ssm=max_ssm,
+                cb=callback, memo=memo))
 
         task_iters = [(task, make_vw(task)) for task in self.tasks]
 
@@ -958,48 +981,51 @@ class PumaAllocator(object):
         memo['n_running'] = len(running)
         memo['n_calls'] = 0
 
-        for task, task_iter in cycle(task_iters):
 
-            if task in running:
-                try:
+        while True:
+            for task, task_iter in task_iters:
 
-                    i, te, min_error, steps_since_min, n_iter = next(task_iter)
-                    memo['n_calls'] += 1
+                if task in running:
+                    try:
 
-                    d = {'i': i, 'time': time() - ts, 'step_size': n_iter, 'error': te,
-                         'target_error': target_error,
-                         'size': np.sum(task.allocated_weights),
-                         'ssm': steps_since_min,
-                         'min_error': min_error,
-                         'task': task
-                         }
+                        i, te, min_error, steps_since_min, n_iter = next(task_iter)
+                        memo['n_calls'] += 1
 
-                    rows.append(d)
+                        d = {'i': i, 'time': time() - ts, 'step_size': n_iter, 'error': te,
+                             'target_error': target_error,
+                             'size': np.sum(task.allocated_weights),
+                             'ssm': steps_since_min,
+                             'min_error': min_error,
+                             'task': task
+                             }
 
-                    if callback and i % 10 == 0:
-                        callback(self, task, d, memo)
+                        rows.append(d)
 
-                except StopIteration:
+                        if callback and i % 10 == 0:
+                            callback(self, task, d, memo)
 
-                    stopped.add(task)
-                    running.remove(task)
+                    except StopIteration:
 
-                    if len(running) == 0:
-                        return rows
+                        stopped.add(task)
+                        running.remove(task)
 
-                    memo['n_stopped'] = len(stopped)
-                    memo['n_running'] = len(running)
+                        memo['n_stopped'] = len(stopped)
+                        memo['n_running'] = len(running)
 
-            callback(self, None, None, memo)
+                        if len(running) == 0:
+                            return rows
 
-        return rows
+                if callback:
+                    # vector_walk_callback(puma_task, tract_task, data, memo):
+                    callback(self, None, None, memo)
 
-    def run(self, *args, callback=None, init_callback=None, memo=None, **kwargs):
+        assert False # Should never get here.
+
+    def run(self, *args, callback=None, memo=None, **kwargs):
 
         self.init(init_method='sample')
 
-        rows = self.vector_walk(*args, callback=callback, init_cb=init_callback,
-                                memo=memo, **kwargs)
+        rows = self.vector_walk(*args, callback=callback, memo=memo, **kwargs)
 
         self.save_frame()
 
@@ -1134,7 +1160,10 @@ class PumaAllocator(object):
 
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        frames = [task.results_frame for task in self.tasks]
+        def rf(df):
+            return df[df.weight > 0]
+
+        frames = [rf(task.results_frame) for task in self.tasks]
         df = pd.concat(frames)
 
         df.to_csv(path, index=False)
